@@ -1,14 +1,45 @@
-from webhook_relay_service import digest, normalize, run
+from webhook_relay_service import WebhookRelay, verify_signature
 
-def test_normalize_deterministic():
-    assert normalize({'b': 1, 'a': 2}) == normalize({'a': 2, 'b': 1})
 
-def test_digest_stable():
-    assert digest('x') == digest('x')
-    assert digest({'k': 'v'}) == digest({'k': 'v'})
+def test_signature_verifies():
+    from webhook_relay_service import sign_payload
 
-def test_run_shapes_result():
-    out = run({'hello': 'world'})
-    assert out['input_type'] == 'dict'
-    assert out['length'] > 0
-    assert len(out['digest']) == 64
+    sig = sign_payload("shh", b"payload", 1000)
+    assert verify_signature("shh", b"payload", 1000, sig) is True
+    assert verify_signature("shh", b"payload", 1001, sig) is False
+    assert verify_signature("other", b"payload", 1000, sig) is False
+    assert verify_signature("shh", b"tampered", 1000, sig) is False
+
+
+def test_delivery_success_first_try():
+    seen = {}
+
+    def transport(url, headers, body):
+        seen["headers"] = headers
+        return True
+
+    r = WebhookRelay("shh", max_attempts=3)
+    res = r.deliver("evt-1", "https://cb.example", {"k": "v"}, transport)
+    assert res["delivered"] is True
+    assert res["attempts"] == 1
+    assert seen["headers"]["X-Webhook-Timestamp"]
+
+
+def test_retry_until_cap():
+    calls = {"n": 0}
+
+    def transport(url, headers, body):
+        calls["n"] += 1
+        return False
+
+    r = WebhookRelay("shh", max_attempts=4, base_delay=0.001)
+    res = r.deliver("evt-2", "https://cb.example", {"x": 1}, transport)
+    assert res["delivered"] is False
+    assert res["attempts"] == 4
+    assert calls["n"] == 4
+
+
+def test_history_recorded():
+    r = WebhookRelay("shh", max_attempts=2, base_delay=0.001)
+    r.deliver("evt-3", "https://cb.example", {"y": 2}, lambda *a: True)
+    assert len(r.deliveries["evt-3"]) == 1

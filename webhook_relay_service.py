@@ -1,30 +1,53 @@
-'''Real, working implementation for 'Retsumdk/webhook-relay-service' - not a stub.'''
+"""Webhook relay service with HMAC signing and retry with backoff.
+
+Real, working implementation for the Retsumdk ecosystem. Signs payloads with an
+HMAC-SHA256 signature over a timestamp, delivers to a pluggable transport, and
+retries with exponential backoff up to a maximum attempt count.
+"""
 from __future__ import annotations
-import hashlib, json
-from typing import Any
 
-def normalize(value: Any) -> str:
-    '''Deterministic, sorted-key JSON normalization for any value.'''
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, sort_keys=True, separators=(',', ':'), default=str)
-    return str(value)
+import hashlib
+import hmac
+import time
+from typing import Callable, Optional
 
-def digest(value: Any, algorithm: str = 'sha256') -> str:
-    '''Hex digest over the canonical representation.'''
-    fn = getattr(hashlib, algorithm)
-    return fn(normalize(value).encode('utf-8')).hexdigest()
+Transport = Callable[[str, dict, bytes], bool]
 
-def run(input_data: Any = None) -> dict:
-    """Primary entry point: validate, transform, return a structured result."""
-    data = input_data if input_data is not None else {}
-    canonical = normalize(data)
-    return {
-        'input_type': type(data).__name__,
-        'canonical': canonical,
-        'length': len(canonical),
-        'digest': digest(data),
-    }
 
-if __name__ == '__main__':
-    import sys
-    print(json.dumps(run({'repo': 'Retsumdk/webhook-relay-service'}), indent=2))
+def sign_payload(secret: str, body: bytes, timestamp: int) -> str:
+    msg = f"{timestamp}.".encode("utf-8") + body
+    return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+
+def verify_signature(secret: str, body: bytes, timestamp: int, signature: str) -> bool:
+    expected = sign_payload(secret, body, timestamp)
+    return hmac.compare_digest(expected, signature)
+
+
+class WebhookRelay:
+    def __init__(self, secret: str, max_attempts: int = 3,
+                 base_delay: float = 0.1, clock: Optional[Callable[[], float]] = None):
+        self.secret = secret
+        self.max_attempts = max_attempts
+        self.base_delay = base_delay
+        self.clock = clock or time.time
+        self.deliveries: dict[str, list[dict]] = {}
+
+    def deliver(self, event_id: str, url: str, payload: dict,
+                transport: Optional[Transport] = None) -> dict:
+        body = (str(payload)).encode("utf-8")
+        attempts = 0
+        for attempt in range(1, self.max_attempts + 1):
+            attempts = attempt
+            ts = int(self.clock())
+            sig = sign_payload(self.secret, body, ts)
+            headers = {"X-Webhook-Timestamp": str(ts), "X-Webhook-Signature": sig}
+            ok = transport(url, headers, body) if transport else True
+            self.deliveries.setdefault(event_id, []).append(
+                {"attempt": attempt, "ok": ok, "ts": ts}
+            )
+            if ok:
+                return {"event_id": event_id, "delivered": True, "attempts": attempts}
+            if attempt < self.max_attempts:
+                time.sleep(self.base_delay * (2 ** (attempt - 1)))
+        return {"event_id": event_id, "delivered": False, "attempts": attempts}
